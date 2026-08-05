@@ -3,5 +3,7 @@
 
 void sensorSetup();
 void sensorLoop();
+float sensorGetLatestTemperature();
+float sensorGetLatestHumidity();
 
 #endif

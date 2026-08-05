@@ -2,6 +2,8 @@
 #include "config.h"
 #include "mqtt_handler.h"
 #include "device_config.h"
+#include "rtc_time.h"
+#include "offline_log.h"
 #include <ArduinoJson.h>
 
 #if defined(DEVICE_GS)
@@ -15,6 +17,22 @@ static unsigned long lastPublishMs = 0;
 static float rawToPercent(int raw, int rawAtZeroPct, int rawAtHundredPct) {
     float pct = (float)(raw - rawAtZeroPct) / (float)(rawAtHundredPct - rawAtZeroPct) * 100.0;
     return constrain(pct, 0.0, 100.0);
+}
+
+static unsigned long readUltrasonicRaw(int trigPin, int echoPin) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    return pulseIn(echoPin, HIGH, 30000UL);
+}
+
+static float distanceToLevelCm(unsigned long durationUs, float emptyCm, float offsetCm) {
+    if (durationUs == 0) return -1;
+    float distanceCm = durationUs * 0.034 / 2.0;
+    float level = emptyCm - distanceCm - offsetCm;
+    return level < 0 ? 0 : level;
 }
 
 // ============================== HWMS ==============================
@@ -34,22 +52,6 @@ static volatile unsigned long flowPulseCount = 0;
 
 void IRAM_ATTR flowISR() {
     flowPulseCount++;
-}
-
-static unsigned long readUltrasonicRaw(int trigPin, int echoPin) {
-    digitalWrite(trigPin, LOW);
-    delayMicroseconds(2);
-    digitalWrite(trigPin, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(trigPin, LOW);
-    return pulseIn(echoPin, HIGH, 30000UL);
-}
-
-static float distanceToLevelCm(unsigned long durationUs, float emptyCm, float offsetCm) {
-    if (durationUs == 0) return -1;
-    float distanceCm = durationUs * 0.034 / 2.0;
-    float level = emptyCm - distanceCm - offsetCm;
-    return level < 0 ? 0 : level;
 }
 
 static void readRaindrop() {
@@ -129,8 +131,8 @@ static void hwmsLoop() {
 static void hwmsBuildPayload(JsonDocument& doc) {
     doc["rain_detected"] = latestRainDetected;
     doc["flow_rate_lpm"] = latestFlowRateLpm;
-    doc["tandon_level_cm"] = latestTandonRwhCm;
-    doc["tandon_level_groundwater_cm"] = latestTandonGroundwaterCm;
+    doc["rwh_level_cm"] = latestTandonRwhCm;
+    doc["groundwater_level_cm"] = latestTandonGroundwaterCm;
 }
 
 #endif // DEVICE_HWMS
@@ -140,10 +142,12 @@ static void hwmsBuildPayload(JsonDocument& doc) {
 
 static unsigned long lastDhtMs = 0;
 static unsigned long lastSoilMs = 0;
+static unsigned long lastBufferMs = 0;
 
 static float latestTemperatureC = 0;
 static float latestHumidityPct = 0;
 static float latestSoilMoisturePct = 0;
+static float latestBufferLevelCm = 0;
 
 static void readDht() {
     float t = dht.readTemperature();
@@ -165,9 +169,26 @@ static void readSoil() {
     latestSoilMoisturePct = rawToPercent(raw, dryRaw, wetRaw);
 }
 
+#if defined(GS_BUFFER_TANK_ENABLED)
+static void readBufferLevel() {
+    JsonDocument& cfg = getDeviceConfig();
+    float emptyCm = cfg["calibration"]["buffer_tank"]["empty_distance_cm"] | 100;
+    float offsetCm = cfg["calibration"]["buffer_tank"]["offset_cm"] | 0;
+
+    unsigned long d = readUltrasonicRaw(PIN_JSN_TRIG, PIN_JSN_ECHO);
+    float level = distanceToLevelCm(d, emptyCm, offsetCm);
+    if (level >= 0) latestBufferLevelCm = level;
+    else Serial.println("Buffer ultrasonic timeout");
+}
+#endif
+
 static void gsSetup() {
     dht.begin();
     pinMode(PIN_SOIL_MOISTURE, INPUT);
+#if defined(GS_BUFFER_TANK_ENABLED)
+    pinMode(PIN_JSN_TRIG, OUTPUT);
+    pinMode(PIN_JSN_ECHO, INPUT);
+#endif
 }
 
 static void gsLoop() {
@@ -185,13 +206,26 @@ static void gsLoop() {
         lastSoilMs = now;
         readSoil();
     }
+#if defined(GS_BUFFER_TANK_ENABLED)
+    unsigned long bufferInterval = (cfg["interval_seconds"]["buffer_tank"] | 60) * 1000UL;
+    if (now - lastBufferMs >= bufferInterval) {
+        lastBufferMs = now;
+        readBufferLevel();
+    }
+#endif
 }
 
 static void gsBuildPayload(JsonDocument& doc) {
     doc["temperature_c"] = latestTemperatureC;
     doc["humidity_pct"] = latestHumidityPct;
     doc["soil_moisture_pct"] = latestSoilMoisturePct;
+#if defined(GS_BUFFER_TANK_ENABLED)
+    doc["buffer_level_cm"] = latestBufferLevelCm;
+#endif
 }
+
+float sensorGetLatestTemperature() { return latestTemperatureC; }
+float sensorGetLatestHumidity() { return latestHumidityPct; }
 
 #endif // DEVICE_GS
 
@@ -219,6 +253,7 @@ void sensorLoop() {
     lastPublishMs = now;
 
     JsonDocument doc;
+    doc["ts"] = rtcGetEpochUtc();
 #if defined(DEVICE_HWMS)
     hwmsBuildPayload(doc);
 #endif
@@ -228,6 +263,11 @@ void sensorLoop() {
 
     String payload;
     serializeJson(doc, payload);
-    mqttPublishSensorData(payload);
+
+    if (mqttIsConnected()) {
+        mqttPublishSensorData(payload);
+    } else {
+        offlineLogRecordIfDue(payload);
+    }
     Serial.println(payload);
 }
